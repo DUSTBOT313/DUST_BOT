@@ -2,7 +2,6 @@ import json
 import time
 import base58
 import os
-import asyncio
 from solana.rpc.api import Client
 from solana.rpc.types import TxOpts
 from solana.keypair import Keypair
@@ -16,18 +15,14 @@ import requests
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 import telebot
-import redis
-from concurrent.futures import ThreadPoolExecutor
 
 app = Flask(__name__)
 CORS(app)
 
-# Config
 RPC_ENDPOINT = os.getenv('RPC_ENDPOINT', 'https://api.mainnet-beta.solana.com')
 WALLET_PRIVATE_KEY_B58 = os.getenv('WALLET_PRIVATE_KEY')
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN', '8293367338:AAGJZlGNUDDXx3H88GkTvyuBCcAXA5sjlhU')
 MINI_APP_URL = os.getenv('MINI_APP_URL', 'https://dust-jzt3jnjgf-dust-bot.vercel.app')
-REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379')
 JUPITER_QUOTE_API = "https://quote-api.jup.ag/v6/quote"
 JUPITER_SWAP_API = "https://quote-api.jup.ag/v6/swap"
 INCINERATOR_API = "https://v1.api.sol-incinerator.com"
@@ -59,9 +54,6 @@ else:
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 headers = {"x-api-key": API_KEY} if API_KEY else {}
-
-r = redis.from_url(REDIS_URL)
-executor = ThreadPoolExecutor(max_workers=4)
 
 successful_buys = 0
 total_fees_sent = 0.0
@@ -124,34 +116,166 @@ def execute_swap(quote_response):
         return True
     return False
 
-async def async_execute_swap(quote_response):
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(executor, execute_swap, quote_response)
+def get_token_accounts():
+    accounts = []
+    for program_id in [TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID]:
+        resp = client.get_token_accounts_by_owner(WALLET_PUBKEY, {"program_id": program_id}, commitment="confirmed")
+        for acc_info in resp.value:
+            acc_pubkey = acc_info.pubkey
+            balance_resp = client.get_token_account_balance(acc_pubkey)
+            if balance_resp.value and int(balance_resp.value.amount) > 0:
+                accounts.append({
+                    'account': acc_pubkey,
+                    'mint': PublicKey(balance_resp.value.mint),
+                    'amount': int(balance_resp.value.amount),
+                    'program_id': program_id
+                })
+    return accounts
 
-def queue_user_job(user_id, action, params):
-    job = json.dumps({'user_id': user_id, 'action': action, 'params': params, 'timestamp': time.time()})
-    r.lpush('user_queue', job)
-    return f"Job queued for user {user_id}: {action}"
+def manual_burn_batch(accounts_batch):
+    tx = Transaction()
+    reclaimed = 0
+    for acc in accounts_batch:
+        try:
+            burn_ix = burn(BurnParams(
+                program_id=acc['program_id'],
+                account=acc['account'],
+                mint=acc['mint'],
+                authority=WALLET_PUBKEY,
+                amount=acc['amount']
+            ))
+            tx.add(burn_ix)
+            close_ix = close_account(CloseAccountParams(
+                program_id=acc['program_id'],
+                account=acc['account'],
+                dest=WALLET_PUBKEY,
+                owner=WALLET_PUBKEY,
+                authority=WALLET_PUBKEY
+            ))
+            tx.add(close_ix)
+            reclaimed += 0.002
+        except Exception as e:
+            print(f"Failed to add manual IX for {acc['mint']}: {e}")
+    if len(tx.instructions) > 0:
+        tx.sign(keypair)
+        try:
+            sig = client.send_transaction(tx, opts=TX_OPTS).value
+            print(f"Manual Batch Burn/Close TX ({len(accounts_batch)} accounts): https://solscan.io/tx/{sig}")
+            return True, reclaimed
+        except Exception as e:
+            print(f"Manual batch failed: {e}")
+            return False, 0
+    return False, 0
 
-def process_queue():
-    while True:
-        job = r.brpop('user_queue', timeout=5)
-        if job:
-            data = json.loads(job[1])
-            user_id = data['user_id']
-            action = data['action']
-            print(f"Processed {action} for {user_id}")
+def auto_burn_via_api(accounts):
+    total_reclaimed = 0
+    api_success_count = 0
+    manual_count = 0
+    for acc in accounts:
+        if headers:
+            preview_resp = requests.post(f"{INCINERATOR_API}/burn/preview", json={
+                "userPublicKey": str(WALLET_PUBKEY),
+                "assetId": str(acc['account'])
+            }, headers=headers)
+            if preview_resp.status_code == 200:
+                preview = preview_resp.json()
+                print(f"Preview for {str(acc['mint'])[:8]}...: Reclaim ~{preview.get('reclaimedSol', 0)} SOL + rewards")
+
+        api_success = False
+        for attempt in range(2):
+            if headers:
+                burn_resp = requests.post(f"{INCINERATOR_API}/burn", json={
+                    "userPublicKey": str(WALLET_PUBKEY),
+                    "assetId": str(acc['account'])
+                }, headers=headers)
+                if burn_resp.status_code == 200:
+                    tx_b64 = burn_resp.json()["serializedTransaction"]
+                    tx = VersionedTransaction.from_bytes(base58.b58decode(tx_b64))
+                    tx.sign([keypair])
+                    sig = client.send_transaction(tx, opts=TX_OPTS).value
+                    print(f"Auto-Burn TX (w/ rewards): https://solscan.io/tx/{sig}")
+                    api_success = True
+                    api_success_count += 1
+                    total_reclaimed += 0.002
+                    break
+                else:
+                    print(f"API attempt {attempt+1} failed: {burn_resp.text}")
+                    time.sleep(1)
+
+        if not api_success:
+            print(f"Falling back to manual burn for {str(acc['mint'])[:8]}...")
+            batch = [acc]
+            success, reclaimed = manual_burn_batch(batch)
+            if success:
+                total_reclaimed += reclaimed
+                manual_count += 1
+            else:
+                print(f"Manual burn failed for {acc['mint']}")
+
         time.sleep(1)
 
-from threading import Thread
-queue_thread = Thread(target=process_queue, daemon=True)
-queue_thread.start()
+    if headers:
+        batch_resp = requests.post(f"{INCINERATOR_API}/batch/close-all", json={
+            "userPublicKey": str(WALLET_PUBKEY)
+        }, headers=headers)
+        if batch_resp.status_code == 200:
+            for tx_b64 in batch_resp.json().get("transactions", []):
+                tx = VersionedTransaction.from_bytes(base58.b58decode(tx_b64))
+                tx.sign([keypair])
+                sig = client.send_transaction(tx, opts=TX_OPTS).value
+                print(f"API Batch Close TX: https://solscan.io/tx/{sig}")
 
-def run_dust_bot(user_id):
+    print(f"API burns: {api_success_count}, Manual burns: {manual_count}")
+    print(f"Total estimated reclaim: ~{total_reclaimed} SOL (check wallet)")
+    return total_reclaimed
+
+def burn_all_tokens():
+    accounts = get_token_accounts()
+    print(f"Found {len(accounts)} dusty accounts to burn.")
+    if not accounts:
+        print("No tokens to burn.")
+        return 0
+    return auto_burn_via_api(accounts)
+
+def send_remaining_to_incinerator():
+    balance_lamports = client.get_balance(WALLET_PUBKEY).value
+    if balance_lamports > 5_000 and balance_lamports < 1_000_000:
+        ix = transfer(TransferParams(
+            from_pubkey=WALLET_PUBKEY,
+            to_pubkey=INCINERATOR_ADDR,
+            lamports=balance_lamports - 5_000
+        ))
+        tx = Transaction().add(ix)
+        tx.sign(keypair)
+        sig = client.send_transaction(tx, opts=TX_OPTS).value
+        print(f"Burned dust SOL: https://solscan.io/tx/{sig}")
+
+def send_transaction_fees():
+    global total_fees_sent
+    num_txs = successful_buys
+    if num_txs == 0:
+        return
+    fee_lamports = int(0.00001 * LAMPORTS_PER_SOL * num_txs)
+    balance_lamports = client.get_balance(WALLET_PUBKEY).value
+    if balance_lamports > fee_lamports + 5000:
+        to_send = min(fee_lamports, balance_lamports - 5000)
+        ix = transfer(TransferParams(
+            from_pubkey=WALLET_PUBKEY,
+            to_pubkey=FEE_WALLET,
+            lamports=to_send
+        ))
+        tx = Transaction().add(ix)
+        tx.sign(keypair)
+        sig = client.send_transaction(tx, opts=TX_OPTS).value
+        fee_sol = to_send / LAMPORTS_PER_SOL
+        print(f"Sent {num_txs} tx fees ({fee_sol:.8f} SOL to {FEE_WALLET}): https://solscan.io/tx/{sig}")
+        total_fees_sent += fee_sol
+
+def run_dust_bot():
     global successful_buys
     successful_buys = 0
     MEME_COINS = fetch_meme_coins()
-    print(f"Proceeding with {len(MEME_COINS)} inactive coins for {user_id}.")
+    print(f"Proceeding with {len(MEME_COINS)} inactive coins.")
     for symbol, token_addr in MEME_COINS:
         current_balance = get_balance()
         if current_balance < 0.0000002:
@@ -167,12 +291,9 @@ def run_dust_bot(user_id):
     send_transaction_fees()
     return successful_buys
 
-# (Include all other functions from v8: get_token_accounts, manual_burn_batch, auto_burn_via_api, burn_all_tokens, send_remaining_to_incinerator, send_transaction_fees)
-
 # Telegram Handlers
 @bot.message_handler(commands=['start'])
 def start_handler(message):
-    user_id = message.from_user.id
     markup = telebot.types.ReplyKeyboardMarkup(one_time_keyboard=True)
     btn_launch = telebot.types.KeyboardButton('Launch Dashboard', web_app=telebot.types.WebAppInfo(url=MINI_APP_URL))
     markup.add(btn_launch)
@@ -185,15 +306,15 @@ def status_handler(message):
 
 @bot.message_handler(commands=['run'])
 def run_handler(message):
-    user_id = message.from_user.id
-    queue_user_job(user_id, 'buy', {})
-    bot.reply_to(message, "Dust buy queued—check /status.")
+    bot.reply_to(message, "Running dust accumulator...")
+    buys = run_dust_bot()
+    bot.reply_to(message, f"Completed {buys} buys! Check logs.")
 
 @bot.message_handler(commands=['burn'])
 def burn_handler(message):
-    user_id = message.from_user.id
-    queue_user_job(user_id, 'burn', {})
-    bot.reply_to(message, "Burn queued.")
+    bot.reply_to(message, "Burning dust...")
+    reclaimed = burn_all_tokens()
+    bot.reply_to(message, f"Reclaimed ~{reclaimed} SOL!")
 
 @bot.message_handler(func=lambda message: True)
 def echo_handler(message):
@@ -207,14 +328,12 @@ def webhook():
 
 @app.route('/api/run-bot', methods=['POST'])
 def api_run_bot():
-    user_id = request.json.get('user_id', 'default')
-    buys = run_dust_bot(user_id)
-    return jsonify({'logs': f'Completed {buys} buys for {user_id}'})
+    buys = run_dust_bot()
+    return jsonify({'logs': f'Completed {buys} buys, fees sent'})
 
 @app.route('/api/burn', methods=['POST'])
 def api_burn():
-    user_id = request.json.get('user_id', 'default')
-    reclaimed = burn_all_tokens()  # Adapt for user
+    reclaimed = burn_all_tokens()
     return jsonify({'reclaimed': reclaimed})
 
 @app.route('/api/logs', methods=['GET'])
