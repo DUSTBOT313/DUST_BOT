@@ -177,4 +177,176 @@ def auto_burn_via_api(accounts):
             preview_resp = requests.post(f"{INCINERATOR_API}/burn/preview", json={
                 "userPublicKey": str(WALLET_PUBKEY),
                 "assetId": str(acc['account'])
-            }, headers
+            }, headers=headers)
+            if preview_resp.status_code == 200:
+                preview = preview_resp.json()
+                print(f"Preview for {str(acc['mint'])[:8]}...: Reclaim ~{preview.get('reclaimedSol', 0)} SOL + rewards")
+
+        api_success = False
+        for attempt in range(2):
+            if headers:
+                burn_resp = requests.post(f"{INCINERATOR_API}/burn", json={
+                    "userPublicKey": str(WALLET_PUBKEY),
+                    "assetId": str(acc['account'])
+                }, headers=headers)
+                if burn_resp.status_code == 200:
+                    tx_b64 = burn_resp.json()["serializedTransaction"]
+                    tx = VersionedTransaction.from_bytes(base58.b58decode(tx_b64))
+                    tx.sign([keypair])
+                    sig = client.send_transaction(tx, opts=TX_OPTS).value
+                    print(f"Auto-Burn TX (w/ rewards): https://solscan.io/tx/{sig}")
+                    api_success = True
+                    api_success_count += 1
+                    total_reclaimed += 0.002
+                    break
+                else:
+                    print(f"API attempt {attempt+1} failed: {burn_resp.text}")
+                    time.sleep(1)
+
+        if not api_success:
+            print(f"Falling back to manual burn for {str(acc['mint'])[:8]}...")
+            batch = [acc]
+            success, reclaimed = manual_burn_batch(batch)
+            if success:
+                total_reclaimed += reclaimed
+                manual_count += 1
+            else:
+                print(f"Manual burn failed for {acc['mint']}")
+
+        time.sleep(1)
+
+    if headers:
+        batch_resp = requests.post(f"{INCINERATOR_API}/batch/close-all", json={
+            "userPublicKey": str(WALLET_PUBKEY)
+        }, headers=headers)
+        if batch_resp.status_code == 200:
+            for tx_b64 in batch_resp.json().get("transactions", []):
+                tx = VersionedTransaction.from_bytes(base58.b58decode(tx_b64))
+                tx.sign([keypair])
+                sig = client.send_transaction(tx, opts=TX_OPTS).value
+                print(f"API Batch Close TX: https://solscan.io/tx/{sig}")
+
+    print(f"API burns: {api_success_count}, Manual burns: {manual_count}")
+    print(f"Total estimated reclaim: ~{total_reclaimed} SOL (check wallet)")
+    return total_reclaimed
+
+def burn_all_tokens():
+    accounts = get_token_accounts()
+    print(f"Found {len(accounts)} dusty accounts to burn.")
+    if not accounts:
+        print("No tokens to burn.")
+        return 0
+    return auto_burn_via_api(accounts)
+
+def send_remaining_to_incinerator():
+    balance_lamports = client.get_balance(WALLET_PUBKEY).value
+    if balance_lamports > 5_000 and balance_lamports < 1_000_000:
+        ix = transfer(TransferParams(
+            from_pubkey=WALLET_PUBKEY,
+            to_pubkey=INCINERATOR_ADDR,
+            lamports=balance_lamports - 5_000
+        ))
+        tx = Transaction().add(ix)
+        tx.sign(keypair)
+        sig = client.send_transaction(tx, opts=TX_OPTS).value
+        print(f"Burned dust SOL: https://solscan.io/tx/{sig}")
+
+def send_transaction_fees():
+    global total_fees_sent
+    num_txs = successful_buys
+    if num_txs == 0:
+        return
+    fee_lamports = int(0.00001 * LAMPORTS_PER_SOL * num_txs)
+    balance_lamports = client.get_balance(WALLET_PUBKEY).value
+    if balance_lamports > fee_lamports + 5000:
+        to_send = min(fee_lamports, balance_lamports - 5000)
+        ix = transfer(TransferParams(
+            from_pubkey=WALLET_PUBKEY,
+            to_pubkey=FEE_WALLET,
+            lamports=to_send
+        ))
+        tx = Transaction().add(ix)
+        tx.sign(keypair)
+        sig = client.send_transaction(tx, opts=TX_OPTS).value
+        fee_sol = to_send / LAMPORTS_PER_SOL
+        print(f"Sent {num_txs} tx fees ({fee_sol:.8f} SOL to {FEE_WALLET}): https://solscan.io/tx/{sig}")
+        total_fees_sent += fee_sol
+
+def run_dust_bot():
+    global successful_buys
+    successful_buys = 0
+    MEME_COINS = fetch_meme_coins()
+    print(f"Proceeding with {len(MEME_COINS)} inactive coins.")
+    for symbol, token_addr in MEME_COINS:
+        current_balance = get_balance()
+        if current_balance < 0.0000002:
+            print("Out of dust! Starting auto-burn phase.")
+            break
+        print(f"Buying dust from inactive {symbol}...")
+        quote = get_quote(SOL_MINT, PublicKey(token_addr), MIN_SWAP_AMOUNT_LAMPORTS)
+        if quote and execute_swap(quote):
+            print(f"Got dust from inactive {symbol}!")
+        time.sleep(DELAY_SEC)
+    burn_all_tokens()
+    send_remaining_to_incinerator()
+    send_transaction_fees()
+    return successful_buys
+
+@bot.message_handler(commands=['start'])
+def start_handler(message):
+    markup = telebot.types.ReplyKeyboardMarkup(one_time_keyboard=True)
+    btn_launch = telebot.types.KeyboardButton('Launch Dashboard', web_app=telebot.types.WebAppInfo(url=MINI_APP_URL))
+    markup.add(btn_launch)
+    bot.reply_to(message, "Welcome to Solana Dust Bot! Connect your wallet and start accumulating dust.", reply_markup=markup)
+
+@bot.message_handler(commands=['status'])
+def status_handler(message):
+    status = f"Successful Buys: {successful_buys} | Fees Sent: {total_fees_sent:.6f} SOL"
+    bot.reply_to(message, status)
+
+@bot.message_handler(commands=['run'])
+def run_handler(message):
+    bot.reply_to(message, "Running dust accumulator...")
+    buys = run_dust_bot()
+    bot.reply_to(message, f"Completed {buys} buys! Check logs.")
+
+@bot.message_handler(commands=['burn'])
+def burn_handler(message):
+    bot.reply_to(message, "Burning dust...")
+    reclaimed = burn_all_tokens()
+    bot.reply_to(message, f"Reclaimed ~{reclaimed} SOL!")
+
+@bot.message_handler(func=lambda message: True)
+def echo_handler(message):
+    bot.reply_to(message, "Use /start for dashboard, /status, /run, or /burn.")
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    update = telebot.types.Update.de_json(request.get_json())
+    bot.process_new_updates([update])
+    return 'OK', 200
+
+@app.route('/api/run-bot', methods=['POST'])
+def api_run_bot():
+    buys = run_dust_bot()
+    return jsonify({'logs': f'Completed {buys} buys, fees sent'})
+
+@app.route('/api/burn', methods=['POST'])
+def api_burn():
+    reclaimed = burn_all_tokens()
+    return jsonify({'reclaimed': reclaimed})
+
+@app.route('/api/logs', methods=['GET'])
+def api_logs():
+    return jsonify(['Dust bot logs...'])
+
+@app.route('/api/status', methods=['GET'])
+def api_status():
+    return jsonify({
+        'successful_buys': successful_buys,
+        'total_fees_sent': total_fees_sent,
+        'fee_wallet': str(FEE_WALLET)
+    })
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
