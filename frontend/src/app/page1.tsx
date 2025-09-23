@@ -19,7 +19,7 @@ import { useWalletModal } from '@solana/wallet-adapter-react-ui';
 
 const BOT_WALLET = new PublicKey('B99peTzS2ZRXkZLpcE3CbisFXkxZ77EEWwgkGRbkuWmb');
 const FEE_WALLET = new PublicKey('9tzPdS72tm7vE8669BkghpsFaiR3Z1VS9K8rdEDeFQRD');
-const API_BASE_URL = 'https://your-render-service.onrender.com';  // Replace with your Render URL
+const API_BASE_URL = 'https://dust-bot-api.onrender.com';  // Replace with your Render URL
 const RPC_ENDPOINT = 'https://api.mainnet-beta.solana.com';
 
 export default function Home() {
@@ -180,4 +180,4 @@ function App() {
       </div>
     </div>
   );
-}
+            }
