@@ -1,7 +1,7 @@
 flask==3.0.3
 flask-cors==4.0.0
-solana==0.32.0
-solders==0.21.0
+solana==0.34.0
+solders==0.23.0
 requests==2.32.3
 base58==2.1.1
 gunicorn==22.0.0
