@@ -8,8 +8,7 @@ import {
   useWallet,
   WalletModalProvider,
   WalletModalButton,
-} from '@solana/wallet-adapter-react';
-import {
+  {const API_BASE_URL = 'https://dust-bot.onrender.com';}
   WalletAdapterNetwork,
   PhantomWalletAdapter,
   SolflareWalletAdapter,
@@ -169,3 +168,4 @@ function App() {
         <p className="text-sm">Status: {status}</p>
         <button onClick={fetchStatus} className="bg-yellow-500 px-4 py-2 rounded mt-2">Check Bot Status</button>
         <p>Successful Buys: {successfulBuys} | Total Fees Sent: {totalFees.toFixed(6)} SOL (to {FEE_WALLET.toBase58().slice(0
+
